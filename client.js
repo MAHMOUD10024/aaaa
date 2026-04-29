@@ -1,48 +1,51 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useSingleFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
 const qrcode = require('qrcode-terminal');
-const { Boom } = require('@hapi/boom');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
+const AUTH_FILE = path.join(__dirname, 'auth.json');
 let sock = null;
 
+const loadAuth = () => {
+  if (fs.existsSync(AUTH_FILE)) {
+    return JSON.parse(fs.readFileSync(AUTH_FILE, 'utf8'));
+  }
+  return undefined;
+};
+
+const saveAuth = (state) => {
+  fs.writeFileSync(AUTH_FILE, JSON.stringify(state));
+};
+
 const startClient = async (messageHandler) => {
-  const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-
-  const phoneNumber = process.env.PHONE_NUMBER?.replace(/\D/g, '');
-
+  const auth = loadAuth();
+  
   sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: !phoneNumber,
-    logger: require('pino')({ level: 'silent' }),
-    browser: ['Windows', 'Chrome', '120.0'],
+    auth: auth ? { state: auth, saveCreds: () => {} } : undefined,
+    printQRInTerminal: true,
+    logger: { level: 'silent' },
+    browser: ['Chrome', 'Chrome', '120.0'],
+    markOnlineOnConnect: false,
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  sock.ev.on('creds.update', () => {
+    if (sock.authState) saveAuth(sock.authState);
+  });
 
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
-
+    
     if (connection === 'close') {
-      const shouldReconnect = (lastDisconnect.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-      if (shouldReconnect) startClient(messageHandler);
-    }
-    else if (connection === 'open') {
-      console.log('✅ تم ربط الرقم بنجاح! البوت يعمل الآن.');
-    }
-    else if (qr) {
-      if (phoneNumber) {
-        // طلب الكود المؤقت تلقائياً لو الرقم موجود في .env
-        try {
-          const code = await sock.requestPairingCode(phoneNumber);
-          console.log(`\n🔑 الكود المؤقت (Pairing Code) هو: ${code}`);
-          console.log(' اذهب إلى واتساب هاتفك > الإعدادات > الأجهزة المرتبطة > ربط جهاز > أدخل الكود أعلاه\n');
-        } catch (err) {
-          console.error('❌ فشل في طلب الكود المؤقت:', err.message);
-        }
-      } else {
-        console.log('📱 امسح الـ QR Code التالي:');
-        qrcode.generate(qr, { small: true });
+      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+      if (shouldReconnect) {
+        console.log('🔄 إعادة الاتصال...');
+        setTimeout(() => startClient(messageHandler), 3000);
       }
+    } else if (connection === 'open') {
+      console.log('✅ البوت متصل وجاهز!');
+    } else if (qr) {
+      qrcode.generate(qr, { small: true });
     }
   });
 
@@ -51,22 +54,32 @@ const startClient = async (messageHandler) => {
     const msg = m.messages[0];
     if (!msg.message) return;
 
-    let text = msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      msg.message.listResponseMessage?.singleSelectReply?.selectedRowId ||
-      '';
-
-    const sender = msg.key.remoteJid.replace('@s.whatsapp.net', '').replace('@c.us', '');
+    const text = msg.message.conversation || 
+                 msg.message.extendedTextMessage?.text ||
+                 msg.message.buttonsResponseMessage?.selectedButtonId ||
+                 '';
+    
+    const sender = msg.key.remoteJid.split('@')[0];
     await messageHandler(sender, text, msg);
   });
 
   return sock;
 };
 
-const sendMessage = async (jid, text) => {
-  if (!sock) return console.warn('⚠️ البوت غير متصل.');
-  const fullJid = jid.includes('@') ? jid : `${jid}@s.whatsapp.net`;
-  await sock.sendMessage(fullJid, { text });
+const sendMessage = async (jid, text, buttons = []) => {
+  if (!sock) return;
+  const fullJid = `${jid}@s.whatsapp.net`;
+  
+  if (buttons.length > 0) {
+    // إرسال مع أزرار (محاكاة)
+    let btnText = text + '\n\n';
+    buttons.forEach((b, i) => {
+      btnText += `${i + 1}. ${b.text}\n`;
+    });
+    await sock.sendMessage(fullJid, { text: btnText });
+  } else {
+    await sock.sendMessage(fullJid, { text });
+  }
 };
 
 module.exports = { startClient, sendMessage };
